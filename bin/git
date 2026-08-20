@@ -1,0 +1,22 @@
+#!/usr/bin/env bun
+/**
+ * bin/git — drop-in git shim.
+ * Intercepts every git invocation and runs it through git-policy.ts.
+ *
+ * Installed via symlink: ~/.local/bin/git -> this file
+ * Real git binary: /usr/bin/git
+ */
+import { spawnSync } from "child_process";
+import { resolve, dirname } from "path";
+import { fileURLToPath } from "url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const policyScript = resolve(__dirname, "../scripts/git-policy.ts");
+
+const result = spawnSync(
+  "bun",
+  ["run", policyScript, ...process.argv.slice(2)],
+  { stdio: "inherit" }
+);
+
+process.exit(result.status ?? 1);

@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# Safe commit helper. Stages only listed paths; blocks "." and empty messages.
+# Usage: committer "type(scope): message" "file1" ["file2" ...]
+#
+# Examples:
+#   committer "feat(api): add rate limiting" apps/api/src/middleware/rate-limit.ts
+#   committer "fix(web): login redirect loop" apps/web/src/pages/login.tsx apps/web/src/hooks/use-auth.ts
+#   committer "test(shared): progression edge cases" packages/shared/src/generic-engine.test.ts
+#
+# Adapted from steipete/agent-scripts for Bun monorepo workflow.
+
+set -euo pipefail
+set -f  # disable glob expansion for bracket paths
+
+# Use real git binary directly — bypasses the git shim.
+# The shim blocks git add/commit for safety; committer is the authorized path.
+GIT_BIN="/usr/bin/git"
+
+# Generate a per-invocation token so the shim can verify this is committer
+_COMMITTER_TOKEN="$(head -c 32 /dev/urandom | base64)"
+export _COMMITTER_TOKEN
+
+usage() {
+  printf 'Usage: %s [--force] [--cross-cutting] [--verbose-comments] "commit message" "file" ["file" ...]\n' "$(basename "$0")" >&2
+  printf '\nExamples:\n' >&2
+  printf '  %s "feat(api): add endpoint" apps/api/src/routes/new.ts\n' "$(basename "$0")" >&2
+  printf '  %s "fix(web): button alignment" apps/web/src/components/Button.tsx\n' "$(basename "$0")" >&2
+  exit 2
+}
+
+[ "$#" -lt 2 ] && usage
+
+force_delete_lock=false
+allow_cross_cutting=false
+verbose_comments=false
+while true; do
+  case "${1:-}" in
+    --force) force_delete_lock=true; shift ;;
+    --cross-cutting) allow_cross_cutting=true; shift ;;
+    --verbose-comments) verbose_comments=true; shift ;;
+    *) break ;;
+  esac
+done
+
+[ "$#" -lt 2 ] && usage
+
+commit_message=$1
+shift
+
+# Guard: message must not be empty
+if [[ "$commit_message" != *[![:space:]]* ]]; then
+  printf 'Error: commit message must not be empty\n' >&2
+  exit 1
+fi
+
+# Guard: first arg looks like a file path
+if [ -e "$commit_message" ]; then
+  printf 'Error: first argument looks like a file path ("%s"); provide the commit message first\n' "$commit_message" >&2
+  exit 1
+fi
+
+# Validate conventional commit format (warn, don't block)
+# Types aligned with agentero/mono AGENTS.md: feat, fix, chore, docs, test.
+# "chore" covers maintenance, refactoring, configuration, perf, build, ci, style.
+if ! echo "$commit_message" | grep -qE '^(feat|fix|chore|docs|test)(\(.+\))?: .+'; then
+  printf 'Warning: message does not follow Conventional Commits format\n' >&2
+  printf '  Expected: type(scope): description (type in feat|fix|chore|docs|test)\n' >&2
+  printf '  Got: %s\n' "$commit_message" >&2
+fi
+
+files=("$@")
+
+# Guard: block "." — defeats the safety purpose
+for file in "${files[@]}"; do
+  if [ "$file" = "." ]; then
+    printf 'Error: "." is not allowed; list specific paths instead\n' >&2
+    exit 1
+  fi
+done
+
+# Guard: verify all files exist (or are tracked deletions)
+for file in "${files[@]}"; do
+  if [ ! -e "$file" ]; then
+    if ! "$GIT_BIN" ls-files --error-unmatch -- "$file" >/dev/null 2>&1; then
+      if ! "$GIT_BIN" cat-file -e "HEAD:$file" >/dev/null 2>&1; then
+        printf 'Error: file not found: %s\n' "$file" >&2
+        exit 1
+      fi
+    fi
+  fi
+done
+
+# Map a repo path to the scopes that are valid for it, most specific first.
+# Derived from agentero/mono commit history; paths with no entry accept any scope,
+# which is also what makes this a no-op in other repos.
+# pkg/carrierdata is deliberately absent: it is shared by commissions and mktplace.
+scopes_for_path() {
+  case "$1" in
+    infra/*) printf 'infra' ;;
+    cloud-runs/commission-tools/*|pkg/commission/*) printf 'commissions|commission-tools' ;;
+    cloud-runs/adm-insight-ingest/*) printf 'insights' ;;
+    cloud-runs/prod-data-ingester/*) printf 'ingester|insights' ;;
+    cloud-runs/product-hub/*) printf 'product-hub' ;;
+    cloud-runs/site/*) printf 'site' ;;
+    cloud-runs/nipr-*|pkg/nipr/*) printf 'nipr' ;;
+    cloud-runs/agency-appointments/*) printf 'appointments' ;;
+    javascript/portal-ui/*) printf 'mktplace|marketplace|portal-ui' ;;
+    javascript/packages/*) printf 'mktplace|packages|portal-ui|ui' ;;
+    svc/frontend/portal/internal/caddy/*) printf 'caddy|mktplace|portal' ;;
+    svc/frontend/portal/*) printf 'mktplace|portal' ;;
+    pkg/carriers/*) printf 'mktplace|carriers' ;;
+    *) printf '' ;;
+  esac
+}
+
+message_scope=$(printf '%s' "$commit_message" | sed -nE 's/^[a-z]+\(([^)]+)\):.*/\1/p')
+
+if [ -n "$message_scope" ] && [ "$allow_cross_cutting" = false ]; then
+  suggested=''
+  scope_matched=false
+  have_opinion=false
+
+  for file in "${files[@]}"; do
+    valid=$(scopes_for_path "$file")
+    [ -z "$valid" ] && continue
+    have_opinion=true
+    case "|$valid|" in
+      *"|$message_scope|"*) scope_matched=true; break ;;
+    esac
+    [ -z "$suggested" ] && suggested="${valid%%|*}"
+  done
+
+  if [ "$have_opinion" = true ] && [ "$scope_matched" = false ]; then
+    printf 'Error: scope "(%s)" does not match the paths being committed\n' "$message_scope" >&2
+    printf '  Suggested scope: (%s)\n' "$suggested" >&2
+    printf '  Name the area you actually worked on, not the default one.\n' >&2
+    printf '  If this commit genuinely spans areas, re-run with --cross-cutting.\n' >&2
+    exit 1
+  fi
+fi
+
+# Reset staging area, add only our files
+"$GIT_BIN" restore --staged :/ 2>/dev/null || true
+"$GIT_BIN" add -A -- "${files[@]}"
+
+if "$GIT_BIN" diff --staged --quiet; then
+  printf 'Warning: no staged changes for: %s\n' "${files[*]}" >&2
+  exit 1
+fi
+
+# Comment gate: block verbose new comments (rules in comment-lint.ts)
+if [ "$verbose_comments" = false ]; then
+  script_dir="$(dirname "$(readlink -f "$0")")"
+  if ! bun "$script_dir/comment-lint.ts" -- "${files[@]}"; then
+    exit 1
+  fi
+fi
+
+last_commit_error=''
+
+run_git_commit() {
+  local stderr_log
+  stderr_log=$(mktemp)
+  # Redirect stderr to file (no process substitution — avoids race condition on WSL2)
+  if "$GIT_BIN" commit -m "$commit_message" -- "${files[@]}" 2>"$stderr_log"; then
+    cat "$stderr_log" >&2
+    rm -f "$stderr_log"
+    last_commit_error=''
+    return 0
+  fi
+  last_commit_error=$(cat "$stderr_log")
+  cat "$stderr_log" >&2
+  rm -f "$stderr_log"
+  return 1
+}
+
+committed=false
+if run_git_commit; then
+  committed=true
+elif [ "$force_delete_lock" = true ]; then
+  lock_path=$(printf '%s\n' "$last_commit_error" | awk -F"'" '/Unable to create .*\.git\/index\.lock/ { print $2; exit }')
+  if [ -n "$lock_path" ] && [ -e "$lock_path" ]; then
+    rm -f "$lock_path"
+    printf 'Removed stale git lock: %s\n' "$lock_path" >&2
+    if run_git_commit; then
+      committed=true
+    fi
+  fi
+fi
+
+if [ "$committed" = false ]; then
+  exit 1
+fi
+
+printf 'Committed "%s" with %d file(s)\n' "$commit_message" "${#files[@]}"
