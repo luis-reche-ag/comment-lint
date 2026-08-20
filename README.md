@@ -1,4 +1,4 @@
-# Agent git toolkit: committer + comment-lint + git shim
+# agent-git-toolkit: committer + comment-lint + git shim
 
 Guardrails for working with AI coding agents in a git repo. Three layers that
 together make the agent's git usage safe, its commits well-formed, and its
@@ -179,8 +179,8 @@ Requires [Bun](https://bun.sh). Clone, then symlink into a directory that preced
 `/usr/bin` in your `PATH` (e.g. `~/.local/bin`):
 
 ```sh
-git clone git@github.com:luis-reche-ag/comment-lint.git
-cd comment-lint
+git clone git@github.com:luis-reche-ag/agent-git-toolkit.git
+cd agent-git-toolkit
 ln -s "$PWD/scripts/committer"       ~/.local/bin/committer
 ln -s "$PWD/scripts/comment-lint.ts" ~/.local/bin/comment-lint
 ln -s "$PWD/bin/git"                 ~/.local/bin/git        # optional: the full shim
